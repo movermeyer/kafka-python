@@ -45,6 +45,11 @@ class KafkaClient(object):
         'send_buffer_bytes': None,
         'retry_backoff_ms': 100,
         'metadata_max_age_ms': 300000,
+        'security_protocol': 'PLAINTEXT',
+        'ssl_check_hostname': True,
+        'ssl_cafile': None,
+        'ssl_certfile': None,
+        'ssl_keyfile': None,
     }
 
     def __init__(self, **configs):
@@ -118,7 +123,7 @@ class KafkaClient(object):
             log.debug("Attempting to bootstrap via node at %s:%s", host, port)
             bootstrap = BrokerConnection(host, port, **self.config)
             bootstrap.connect()
-            while bootstrap.state is ConnectionStates.CONNECTING:
+            while bootstrap.connecting():
                 bootstrap.connect()
             if bootstrap.state is not ConnectionStates.CONNECTED:
                 bootstrap.close()
@@ -166,7 +171,7 @@ class KafkaClient(object):
     def _finish_connect(self, node_id):
         assert node_id in self._conns, '%s is not in current conns' % node_id
         state = self._conns[node_id].connect()
-        if state is ConnectionStates.CONNECTING:
+        if self._conns[node_id].connecting():
             self._connecting.add(node_id)
         elif node_id in self._connecting:
             log.debug("Node %s connection state is %s", node_id, state)
@@ -254,7 +259,7 @@ class KafkaClient(object):
         time_waited_ms = time.time() - (conn.last_attempt or 0)
         if conn.state is ConnectionStates.DISCONNECTED:
             return max(self.config['reconnect_backoff_ms'] - time_waited_ms, 0)
-        elif conn.state is ConnectionStates.CONNECTING:
+        elif conn.connecting():
             return 0
         else:
             return 999999999
@@ -400,6 +405,13 @@ class KafkaClient(object):
         fds = list(sockets.keys())
         fds.append(self._wake_r)
         ready, _, _ = select.select(fds, [], [], timeout)
+
+        # Check for additional pending SSL bytes
+        if self.config['security_protocol'] in ('SSL', 'SASL_SSL'):
+            # TODO: optimize
+            for conn in self._conns:
+                if conn._sock not in ready and conn._sock.pending():
+                    ready.append(conn._sock)
 
         responses = []
         for sock in ready:

@@ -67,7 +67,7 @@ class SimpleClient(object):
             )
 
         conn = self._conns[host_key]
-        while conn.connect() == ConnectionStates.CONNECTING:
+        while conn.connecting():
             pass
         return conn
 
@@ -413,7 +413,7 @@ class SimpleClient(object):
     def reinit(self):
         for conn in self._conns.values():
             conn.close()
-            while conn.connect() == ConnectionStates.CONNECTING:
+            while conn.connecting():
                 pass
 
     def reset_topic_metadata(self, *topics):

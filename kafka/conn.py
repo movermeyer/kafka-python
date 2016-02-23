@@ -6,6 +6,7 @@ import io
 from random import shuffle
 from select import select
 import socket
+import ssl
 import struct
 from threading import local
 import time
@@ -34,6 +35,7 @@ DEFAULT_KAFKA_PORT = 9092
 class ConnectionStates(object):
     DISCONNECTED = '<disconnected>'
     CONNECTING = '<connecting>'
+    HANDSHAKE = '<handshake>'
     CONNECTED = '<connected>'
 
 
@@ -49,6 +51,11 @@ class BrokerConnection(object):
         'max_in_flight_requests_per_connection': 5,
         'receive_buffer_bytes': None,
         'send_buffer_bytes': None,
+        'security_protocol': 'PLAINTEXT',
+        'ssl_check_hostname': True,
+        'ssl_cafile': None,
+        'ssl_certfile': None,
+        'ssl_keyfile': None,
         'api_version': (0, 8, 2),  # default to most restrictive
     }
 
@@ -84,21 +91,8 @@ class BrokerConnection(object):
                 self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF,
                                       self.config['send_buffer_bytes'])
             self._sock.setblocking(False)
-            try:
-                ret = self._sock.connect_ex((self.host, self.port))
-            except socket.error as ret:
-                pass
             self.last_attempt = time.time()
-
-            if not ret or ret is errno.EISCONN:
-                self.state = ConnectionStates.CONNECTED
-            elif ret in (errno.EINPROGRESS, errno.EALREADY):
-                self.state = ConnectionStates.CONNECTING
-            else:
-                log.error('Connect attempt to %s returned error %s.'
-                          ' Disconnecting.', self, ret)
-                self.close()
-                self.last_failure = time.time()
+            self._try_connect()
 
         if self.state is ConnectionStates.CONNECTING:
             # in non-blocking mode, use repeated calls to socket.connect_ex
@@ -108,20 +102,69 @@ class BrokerConnection(object):
                 log.error('Connection attempt to %s timed out', self)
                 self.close() # error=TimeoutError ?
                 self.last_failure = time.time()
-
             else:
-                try:
-                    ret = self._sock.connect_ex((self.host, self.port))
-                except socket.error as ret:
-                    pass
-                if not ret or ret is errno.EISCONN:
-                    self.state = ConnectionStates.CONNECTED
-                elif ret is not errno.EALREADY:
-                    log.error('Connect attempt to %s returned error %s.'
-                              ' Disconnecting.', self, ret)
-                    self.close()
-                    self.last_failure = time.time()
+                self._try_connect()
+
+        if self.state is ConnectionStates.HANDSHAKE:
+            self._try_handshake()
+
         return self.state
+
+    def _try_connect(self):
+        if self.state is ConnectionStates.CONNECTED:
+            log.debug('_try_connect called on connected socket')
+            return
+
+        try:
+            ret = self._sock.connect_ex((self.host, self.port))
+        except socket.error as ret:
+            pass
+
+        if not ret or ret is errno.EISCONN:
+            self.state = ConnectionStates.CONNECTED
+            self._wrap_ssl_if_needed()
+        elif ret in (errno.EINPROGRESS, errno.EALREADY):
+            self.state = ConnectionStates.CONNECTING
+        else:
+            log.error('Connect attempt to %s returned error %s.'
+                      ' Disconnecting.', self, ret)
+            self.close()
+            self.last_failure = time.time()
+
+    def _wrap_ssl_if_needed(self):
+        if self.config['security_protocol'] not in ('SSL', 'SASL_SSL'):
+            return
+        context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)  # pylint: disable=no-member
+        context.options |= ssl.OP_NO_SSLv2  # pylint: disable=no-member
+        context.options |= ssl.OP_NO_SSLv3  # pylint: disable=no-member
+        context.verify_mode = ssl.CERT_OPTIONAL
+        if self.config['ssl_check_hostname']:
+            context.check_hostname = True
+        if self.config['ssl_cafile']:
+            context.load_verify_locations(self.config['ssl_cafile'])
+            context.verify_mode = ssl.CERT_REQUIRED
+        if self.config['ssl_certfile'] and self.config['ssl_keyfile']:
+            context.load_cert_chain(certfile=self.config['ssl_certfile'],
+                                    keyfile=self.config['ssl_keyfile'])
+        try:
+            self._sock = context.wrap_socket(self._sock,
+                                             server_hostname=self.host,
+                                             do_handshake_on_connect=False)
+        except ssl.SSLError:
+            log.exception('Unable to connect to Kafka broker at %s:%r over SSL', self.host, self.port)
+            self.close()
+            self.last_failure = time.time()
+        self.state = ConnectionStates.HANDSHAKE
+
+    def _try_handshake(self):
+        if self.config['security_protocol'] not in ('SSL', 'SASL_SSL'):
+            return
+        try:
+            self._sock.do_handshake()
+        except ssl.SSLError:
+            pass
+        else:
+            self.state = ConnectionStates.CONNECTED
 
     def blacked_out(self):
         """
@@ -137,6 +180,11 @@ class BrokerConnection(object):
     def connected(self):
         """Return True iff socket is connected."""
         return self.state is ConnectionStates.CONNECTED
+
+    def connecting(self):
+        """Returns True if still connecting (this may encompass several
+        different states, such as SSL handshake, authorization, etc)."""
+        return self.state is ConnectionStates.CONNECTING
 
     def close(self, error=None):
         """Close socket and fail all in-flight-requests.
@@ -236,9 +284,13 @@ class BrokerConnection(object):
                 self.config['request_timeout_ms']))
             return None
 
-        readable, _, _ = select([self._sock], [], [], timeout)
-        if not readable:
-            return None
+        # SSL-wrapped sockets may have pending data w/o triggering select
+        if not (self.config['security_protocol'] in ('SSL', 'SASL_SSL') and
+                self._sock.pending()):
+
+            readable, _, _ = select([self._sock], [], [], timeout)
+            if not readable:
+                return None
 
         # Not receiving is the state of reading the payload header
         if not self._receiving:
